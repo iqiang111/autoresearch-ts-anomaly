@@ -202,6 +202,7 @@ def main() -> None:
 
     while True:
         for batch in train_loader:
+            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             total_loss, forecast_loss, anomaly_loss = compute_losses(model, batch)
             total_loss.backward()

@@ -244,7 +244,7 @@ def make_dataloader(
         collated = {}
         for key in batch[0]:
             stacked = torch.stack([item[key] for item in batch], dim=0)
-            collated[key] = stacked.to(device)
+            collated[key] = stacked
         return collated
 
     return torch.utils.data.DataLoader(
@@ -312,6 +312,7 @@ def best_f1_threshold(scores: torch.Tensor, labels: torch.Tensor) -> tuple[float
 @torch.no_grad()
 def evaluate_model(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, anomaly_loss_weight: float = 1.0) -> dict[str, float]:
     model.eval()
+    device = next(model.parameters()).device
     total_loss = 0.0
     total_forecast_loss = 0.0
     total_anomaly_loss = 0.0
@@ -320,6 +321,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: torch.utils.data.DataLoad
     label_list = []
 
     for batch in dataloader:
+        batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
         outputs = model(batch["context"])
         forecast_loss = torch.nn.functional.mse_loss(outputs["future_values"], batch["future_values"])
         anomaly_loss = torch.nn.functional.binary_cross_entropy_with_logits(
