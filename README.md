@@ -1,5 +1,7 @@
 # autoresearch-ts-anomaly
 
+[中文说明 / README_zh](./README_zh.md)
+
 Minimal fork of `karpathy/autoresearch` for time-series anomaly prediction research.
 
 This fork keeps the small-repo, fixed-time-budget, agent-friendly workflow, but swaps the original language-modeling task for a sliding-window time-series task:
