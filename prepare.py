@@ -1,389 +1,380 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Time-series data preparation and evaluation utilities for autoresearch-ts-anomaly.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+The script creates a small synthetic multivariate dataset in ./data/ when no
+dataset exists yet. Runtime helpers are imported by train.py.
 """
 
-import os
-import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+from __future__ import annotations
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import argparse
+import math
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Constants
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+CONTEXT_LEN = 128
+PREDICTION_HORIZON = 16
+TIME_BUDGET = 300
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_FEATURE_DIM = 4
+NORMALIZATION_EPS = 1e-6
+
+REPO_ROOT = Path(__file__).resolve().parent
+DATA_DIR = REPO_ROOT / "data"
+DEFAULT_DATASET_PATH = DATA_DIR / "synthetic_timeseries.npz"
+
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Dataset containers
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+@dataclass
+class PreparedSplit:
+    values: torch.Tensor
+    labels: torch.Tensor
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+@dataclass
+class PreparedData:
+    train: PreparedSplit
+    val: PreparedSplit
+    test: PreparedSplit
+    mean: torch.Tensor
+    std: torch.Tensor
+    num_features: int
+    context_len: int
+    prediction_horizon: int
+
+
+class TimeSeriesWindowDataset(torch.utils.data.Dataset):
+    def __init__(self, values: torch.Tensor, labels: torch.Tensor, context_len: int, horizon: int):
+        if values.ndim != 2:
+            raise ValueError(f"Expected values with shape [time, features], got {tuple(values.shape)}")
+        if labels.ndim != 1:
+            raise ValueError(f"Expected labels with shape [time], got {tuple(labels.shape)}")
+        if values.size(0) != labels.size(0):
+            raise ValueError("values and labels must have the same time dimension")
+        if values.size(0) < context_len + horizon:
+            raise ValueError("sequence is shorter than context_len + horizon")
+        self.values = values
+        self.labels = labels
+        self.context_len = context_len
+        self.horizon = horizon
+
+    def __len__(self) -> int:
+        return self.values.size(0) - self.context_len - self.horizon + 1
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        start = idx
+        mid = start + self.context_len
+        end = mid + self.horizon
+        context = self.values[start:mid]
+        future_values = self.values[mid:end]
+        future_labels = self.labels[mid:end]
+        anomaly_target = future_labels.max()
+        return {
+            "context": context,
+            "future_values": future_values,
+            "future_labels": future_labels,
+            "anomaly_target": anomaly_target,
+        }
+
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data IO
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+def generate_synthetic_dataset(
+    output_path: Path = DEFAULT_DATASET_PATH,
+    num_steps: int = 8000,
+    num_features: int = DEFAULT_FEATURE_DIM,
+    anomaly_rate: float = 0.02,
+    seed: int = 42,
+) -> Path:
+    rng = np.random.default_rng(seed)
+    t = np.arange(num_steps, dtype=np.float32)
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+    values = []
+    for feature_idx in range(num_features):
+        freq = 0.005 * (feature_idx + 1)
+        seasonal = np.sin(2 * np.pi * freq * t)
+        trend = 0.0005 * (feature_idx + 1) * t
+        noise = 0.08 * rng.standard_normal(num_steps, dtype=np.float32)
+        values.append(seasonal + trend + noise)
+    values = np.stack(values, axis=1).astype(np.float32)
+
+    labels = np.zeros(num_steps, dtype=np.float32)
+    num_anomalies = max(1, int(num_steps * anomaly_rate))
+    anomaly_positions = rng.choice(np.arange(CONTEXT_LEN, num_steps - PREDICTION_HORIZON), size=num_anomalies, replace=False)
+
+    for pos in anomaly_positions:
+        width = int(rng.integers(4, 16))
+        amp = rng.uniform(2.0, 4.5)
+        channel = int(rng.integers(0, num_features))
+        end = min(num_steps, pos + width)
+        values[pos:end, channel] += amp
+        labels[pos:end] = 1.0
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(output_path, values=values, labels=labels)
+    return output_path
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+def _load_npz(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
+    data = np.load(path)
+    values = data["values"].astype(np.float32)
+    labels = data["labels"].astype(np.float32) if "labels" in data.files else None
+    return values, labels
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+def _load_csv(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
+    frame = pd.read_csv(path)
+    label_col = next((col for col in frame.columns if col.lower() in {"label", "labels", "anomaly", "target"}), None)
+    labels = frame.pop(label_col).to_numpy(dtype=np.float32) if label_col else None
+    values = frame.select_dtypes(include=["number"]).to_numpy(dtype=np.float32)
+    if values.size == 0:
+        raise ValueError(f"No numeric feature columns found in {path}")
+    return values, labels
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+def _weak_labels_from_diff(values: np.ndarray, threshold: float = 3.0) -> np.ndarray:
+    diffs = np.diff(values, axis=0, prepend=values[[0]])
+    z = np.abs((diffs - diffs.mean(axis=0, keepdims=True)) / (diffs.std(axis=0, keepdims=True) + NORMALIZATION_EPS))
+    return (z.max(axis=1) > threshold).astype(np.float32)
+
+
+def load_raw_dataset(path: Path | str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    dataset_path = Path(path) if path else DEFAULT_DATASET_PATH
+    if not dataset_path.exists():
+        dataset_path = generate_synthetic_dataset(dataset_path)
+
+    if dataset_path.suffix == ".npz":
+        values, labels = _load_npz(dataset_path)
+    elif dataset_path.suffix == ".csv":
+        values, labels = _load_csv(dataset_path)
+    else:
+        raise ValueError(f"Unsupported dataset format: {dataset_path.suffix}")
+
+    if values.ndim == 1:
+        values = values[:, None]
+    if labels is None:
+        labels = _weak_labels_from_diff(values)
+    labels = labels.reshape(-1).astype(np.float32)
+    if len(values) != len(labels):
+        raise ValueError("values and labels must have matching length")
+    return values.astype(np.float32), labels
+
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Preparation and loaders
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def _split_lengths(total_steps: int) -> tuple[int, int, int]:
+    train_end = int(total_steps * TRAIN_RATIO)
+    val_end = train_end + int(total_steps * VAL_RATIO)
+    test_end = total_steps
+    return train_end, val_end, test_end
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def _normalize_splits(values: np.ndarray, train_end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mean = values[:train_end].mean(axis=0, keepdims=True)
+    std = values[:train_end].std(axis=0, keepdims=True)
+    normalized = (values - mean) / (std + NORMALIZATION_EPS)
+    return normalized, mean.squeeze(0), std.squeeze(0)
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def prepare_data(
+    dataset_path: Path | str | None = None,
+    context_len: int = CONTEXT_LEN,
+    prediction_horizon: int = PREDICTION_HORIZON,
+) -> PreparedData:
+    values_np, labels_np = load_raw_dataset(dataset_path)
+    train_end, val_end, test_end = _split_lengths(len(values_np))
+    normalized_values, mean_np, std_np = _normalize_splits(values_np, train_end)
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+    values = torch.from_numpy(normalized_values)
+    labels = torch.from_numpy(labels_np)
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    train = PreparedSplit(values=values[:train_end], labels=labels[:train_end])
+    val = PreparedSplit(values=values[train_end:val_end], labels=labels[train_end:val_end])
+    test = PreparedSplit(values=values[val_end:test_end], labels=labels[val_end:test_end])
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    minimum_len = context_len + prediction_horizon
+    for split_name, split in {"train": train, "val": val, "test": test}.items():
+        if split.values.size(0) < minimum_len:
+            raise ValueError(f"{split_name} split is too short for context={context_len} horizon={prediction_horizon}")
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    return PreparedData(
+        train=train,
+        val=val,
+        test=test,
+        mean=torch.from_numpy(mean_np.astype(np.float32)),
+        std=torch.from_numpy(std_np.astype(np.float32)),
+        num_features=values.size(1),
+        context_len=context_len,
+        prediction_horizon=prediction_horizon,
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+def make_dataloader(
+    split: PreparedSplit,
+    batch_size: int,
+    context_len: int,
+    prediction_horizon: int,
+    shuffle: bool,
+    device: str | torch.device,
+) -> torch.utils.data.DataLoader:
+    dataset = TimeSeriesWindowDataset(split.values, split.labels, context_len, prediction_horizon)
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+    def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        collated = {}
+        for key in batch[0]:
+            stacked = torch.stack([item[key] for item in batch], dim=0)
+            collated[key] = stacked.to(device)
+        return collated
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=shuffle,
+        pin_memory=(str(device).startswith("cuda")),
+        collate_fn=collate,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def binary_pr_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    scores = scores.detach().float().cpu()
+    labels = labels.detach().float().cpu()
+    positives = labels.sum().item()
+    if positives <= 0:
+        return 0.0
+
+    order = torch.argsort(scores, descending=True)
+    sorted_labels = labels[order]
+    tp = torch.cumsum(sorted_labels, dim=0)
+    fp = torch.cumsum(1.0 - sorted_labels, dim=0)
+    precision = tp / torch.clamp(tp + fp, min=1.0)
+    recall = tp / positives
+    precision = torch.cat([torch.tensor([1.0]), precision])
+    recall = torch.cat([torch.tensor([0.0]), recall])
+    return torch.trapz(precision, recall).item()
+
+
+def best_f1_threshold(scores: torch.Tensor, labels: torch.Tensor) -> tuple[float, float, float, float]:
+    scores = scores.detach().float().cpu()
+    labels = labels.detach().float().cpu()
+    thresholds = torch.unique(scores)
+    if thresholds.numel() == 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    best_f1 = 0.0
+    best_threshold = thresholds[0].item()
+    best_precision = 0.0
+    best_recall = 0.0
+    for threshold in thresholds:
+        preds = (scores >= threshold).float()
+        tp = (preds * labels).sum().item()
+        fp = (preds * (1.0 - labels)).sum().item()
+        fn = ((1.0 - preds) * labels).sum().item()
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        if precision + recall == 0.0:
+            f1 = 0.0
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            f1 = 2 * precision * recall / (precision + recall)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold.item()
+            best_precision = precision
+            best_recall = recall
+    return best_f1, best_threshold, best_precision, best_recall
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+def evaluate_model(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, anomaly_loss_weight: float = 1.0) -> dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_forecast_loss = 0.0
+    total_anomaly_loss = 0.0
+    batches = 0
+    score_list = []
+    label_list = []
+
+    for batch in dataloader:
+        outputs = model(batch["context"])
+        forecast_loss = torch.nn.functional.mse_loss(outputs["future_values"], batch["future_values"])
+        anomaly_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            outputs["anomaly_logits"], batch["anomaly_target"]
+        )
+        loss = forecast_loss + anomaly_loss_weight * anomaly_loss
+        total_loss += loss.item()
+        total_forecast_loss += forecast_loss.item()
+        total_anomaly_loss += anomaly_loss.item()
+        batches += 1
+        score_list.append(torch.sigmoid(outputs["anomaly_logits"]))
+        label_list.append(batch["anomaly_target"])
+
+    scores = torch.cat(score_list)
+    labels = torch.cat(label_list)
+    pr_auc = binary_pr_auc(scores, labels)
+    best_f1, threshold, precision, recall = best_f1_threshold(scores, labels)
+    return {
+        "val_loss": total_loss / max(batches, 1),
+        "forecast_mse": total_forecast_loss / max(batches, 1),
+        "anomaly_bce": total_anomaly_loss / max(batches, 1),
+        "pr_auc": pr_auc,
+        "best_f1": best_f1,
+        "best_threshold": threshold,
+        "precision": precision,
+        "recall": recall,
+        "positive_rate": labels.float().mean().item(),
+    }
+
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prepare a local time-series dataset for autoresearch-ts-anomaly")
+    parser.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET_PATH), help="Path to a .npz or .csv dataset")
+    parser.add_argument("--num-steps", type=int, default=8000, help="Number of time steps for synthetic data generation")
+    parser.add_argument("--num-features", type=int, default=DEFAULT_FEATURE_DIM, help="Number of features for synthetic data generation")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    dataset_path = Path(args.dataset)
+    if not dataset_path.exists():
+        generate_synthetic_dataset(dataset_path, num_steps=args.num_steps, num_features=args.num_features)
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
+    values, labels = load_raw_dataset(dataset_path)
+    positives = int(labels.sum())
+    print(f"dataset_path:      {dataset_path}")
+    print(f"time_steps:        {len(values)}")
+    print(f"num_features:      {values.shape[1]}")
+    print(f"positive_labels:   {positives}")
+    print(f"positive_ratio:    {positives / max(len(labels), 1):.4f}")
+    print(f"context_len:       {CONTEXT_LEN}")
+    print(f"prediction_horizon:{PREDICTION_HORIZON}")
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+if __name__ == "__main__":
+    main()
